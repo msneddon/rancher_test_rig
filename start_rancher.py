@@ -70,10 +70,25 @@ class RancherServerAPI:
 
 
     def add_host(self, hostname):
+        print('\nadd host')
         payload = {'hostname': hostname}
         r = requests.post(self.url + '/projects/' + self.env_id + '/hosts', data=payload)
         content = r.json()
         pprint(content)
+
+        pass
+
+    # can be used to generate a token used by the agent to connect to the server
+    def generate_registration_token(self):
+        print('\ngen registration token')
+        payload = {'name': 'agent1'}
+        r = requests.post(self.url + '/projects/' + self.env_id + '/registrationTokens', data=payload)
+        content = r.json()
+        registration_token_id = content['id']
+        time.sleep(1)
+        r = requests.get(self.url + '/registrationtokens/' + registration_token_id)
+        pprint(r.json())
+        print(r.url)
 
         pass
 
@@ -162,6 +177,7 @@ class RancherTestRig:
 
         self.rancher_server_api.set_active_environment()
         self.rancher_server_api.add_host('http://localhost')
+        self.rancher_server_api.generate_registration_token()
 
 
 
