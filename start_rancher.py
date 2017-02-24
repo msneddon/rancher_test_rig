@@ -1,113 +1,167 @@
 import os
 import subprocess
 import time
-import gdapi
+import docker
+import requests
 
 from pprint import pprint
 from requests.exceptions import ConnectionError
-from docker import Client as DockerClient
 
-DOCKER_HOST = 'unix://var/run/docker.sock'
 HOST = 'http://localhost'
+
+
+class RancherServerAPI:
+
+    RANCHER_SERVER_START_TIMEOUT = 100
+
+    def __init__(self, url):
+        self.url = url
+        self.env_id = None
+
+    def wait_for_startup(self):
+        for k in range(0, self.RANCHER_SERVER_START_TIMEOUT):
+            try:
+                requests.get(self.url)
+                break
+            except ConnectionError:
+                if k == 0:
+                    print('Rancher server not running, waiting up to ' +
+                          str(self.RANCHER_SERVER_START_TIMEOUT) +
+                          's for rancher to start...')
+                time.sleep(1)
+
+
+    def create_environment(self):
+        r = requests.post('/projects/${PROJECT_ID}/projects/${ID}?action=activate')
+        pprint(r)
+
+    def list_environments(self):
+        r = requests.get(self.url + '/projects')
+        content = r.json()
+
+        envs = []
+        for e in content['data']:
+            envs.append({'id': e['id'],
+                         'name': e['name'],
+                         'healthState': e['healthState'],
+                         'description': e['description']
+                         })
+        return envs
+
+
+    def set_active_environment(self, env_id=None):
+        envs = self.list_environments()
+        env_info = None
+        if env_id is None:
+            self.env_id = envs[0]['id']
+            env_info = envs[0]
+        else:
+            for e in envs:
+                if envs[0]['id'] == env_id:
+                    env_info = envs[0]
+                    self.env_id = env_id
+
+        if not env_info:
+            print('Unable to set active environment.  Available environments are:')
+            pprint(envs)
+        else:
+            print('Active Environment ID: ' + self.env_id)
+            pprint(env_info)
+
+
+    def add_host(self, hostname):
+        payload = {'hostname': hostname}
+        r = requests.post(self.url + '/projects/' + self.env_id + '/hosts', data=payload)
+        content = r.json()
+        pprint(content)
+
+        pass
+
+
 
 class RancherTestRig:
 
-    RANCHER_SERVICE_CONTAINER_NAME = 'rtr-rancher-server'
+    RANCHER_SERVICE_IMG_DEFAULT_NAME = 'rancher/server:latest'
+    RANCHER_SERVICE_CONTAINER_DEFAULT_NAME = 'rtr-rancher-server'
+
     RANCHER_PORT = 8080
     RANCHER_SERVER_START_TIMEOUT = 100
 
-    def __init__(
-                self,
-                docker_host = None,
-                rancher_host = None,
-                rancher_service_img_name = None
-            ):
-        self.docker = DockerClient(base_url=docker_host)
-        self.rancher_service_img_name = 'rancher/server'
-        self.rancher = None
+    def __init__(self,
+                 rancher_host=None,
+                 rancher_service_img_name=RANCHER_SERVICE_IMG_DEFAULT_NAME,
+                 rancher_container_name=RANCHER_SERVICE_CONTAINER_DEFAULT_NAME
+                 ):
+
+        self.docker = docker.from_env()
+
+        self.service_img_name = rancher_service_img_name
+        self.service_container_name = rancher_container_name
+
+
         self.rancher_host = rancher_host
+        self.server_container = self._get_container(self.service_container_name)
+        self.rancher_server_api = RancherServerAPI(self.rancher_host + ':' + str(self.RANCHER_PORT) + '/v2-beta')
 
-        print('RANCHER_HOST'+self.rancher_host)
 
-
-    def start_rancher_server_container(self, rebuild_container=False):
+    def start_rancher_server(self, rebuild=False):
         print('Starting Rancher server...')
-        service_container = self._get_container_by_name(self.RANCHER_SERVICE_CONTAINER_NAME)
 
         # if the container does not exist, then start it
-        if service_container is None:
-            print('No '+self.RANCHER_SERVICE_CONTAINER_NAME+' container exists.  Creating and starting...')
-            self._create_rancher_server_container_and_start()
+        if self.server_container is None:
+            print('No ' + self.service_container_name + ' container exists.  Creating and starting...')
+            self._create_and_start_server_container()
         else:
-            containerId = service_container['Id']
-            if rebuild_container:
-                print(self.RANCHER_SERVICE_CONTAINER_NAME+' container already exists.  You requested to rebuild, so trashing and starting...')
-                self.docker.stop(container=containerId)
-                self.docker.remove_container(container=containerId)
-                self._create_rancher_server_container_and_start()
-
+            if rebuild:
+                print(self.service_container_name + ' container already exists.  ' +
+                      'You requested to rebuild, so trashing and starting...')
+                self.server_container.stop()
+                self.server_container.remove()
+                self._create_and_start_server_container()
             else:
-                print(self.RANCHER_SERVICE_CONTAINER_NAME+' container already exists.  Restarting...')
-                self.docker.restart(container=containerId)
+                print(self.service_container_name + ' container already exists.  Restarting...')
+                self.server_container.restart()
 
 
-    def _get_container_by_name(self, name):
-        filters = { 'name': name }
-        service_containers = self.docker.containers(all=True, filters=filters)
-        if len(service_containers) == 0:
+    def _get_container(self, name):
+        try:
+            return self.docker.containers.get(name)
+        except docker.errors.NotFound:
             return None
-        elif len(service_containers) == 1:
-            return service_containers[0]
-        else:
-            raise ValueError('Error: multiple containers with name: '+name+' exists.  Not sure how that is possible.')
 
 
-    def _create_rancher_server_container_and_start(self):
-        c = self.docker.create_container(
-                                image=self.rancher_service_img_name,
-                                name=self.RANCHER_SERVICE_CONTAINER_NAME,
-                                ports=[self.RANCHER_PORT],
-                                host_config = self.docker.create_host_config(
-                                        port_bindings={self.RANCHER_PORT:self.RANCHER_PORT}
-                                    )
-                            )
-        self.docker.start(container=c['Id'])
-        print('created ' + c['Id'])
-        return c
+    def _create_and_start_server_container(self):
+        self._server_container = self.docker.containers.create(self.service_img_name,
+                                                               name=self.service_container_name,
+                                                               ports={self.RANCHER_PORT: self.RANCHER_PORT}
+                                                               )
+        self._server_container.start()
+        print('created ' + self._server_container.id)
 
 
-    def _get_rancher_client(self):
-        if not self.rancher:
-            for i in range(0, self.RANCHER_SERVER_START_TIMEOUT):
-                try:
-                    self.rancher = gdapi.Client(url=self.rancher_host + ':' + str(self.RANCHER_PORT) + '/v1')
-                    break
-                except ConnectionError:
-                    if i==0:
-                        print('Rancher server not running, waiting up to '+
-                                str(self.RANCHER_SERVER_START_TIMEOUT)+
-                                's for rancher to start...')
-                    time.sleep(1)
-        return self.rancher
 
 
-    def wait_for_rancher_server_to_start(self):
-        rancher = self._get_rancher_client()
-       
 
-    def stop_rancher_server_container(self):
+    def wait_for_server_to_start(self):
+        self.rancher_server_api.wait_for_startup()
+
+
+
+
+
+    def stop_server_container(self):
         print('Stopping Rancher server...')
-        service_container = self._get_container_by_name(self.RANCHER_SERVICE_CONTAINER_NAME)
-
-        # if the container does not exist, then start it
-        if service_container is None:
-            print('No '+self.RANCHER_SERVICE_CONTAINER_NAME+' container exists.')
+        if self.service_container is None:
+            print('No service container (' + self.service_container_name + ') exists.')
         else:
-            containerId = service_container['Id']
-            self.docker.stop(container=containerId)
+            self.service_container.stop()
 
 
-    #def create_rancher_project(self):
+    def basic_configuration(self):
+        # 1) create environment
+
+        self.rancher_server_api.set_active_environment()
+        self.rancher_server_api.add_host('http://localhost')
 
 
 
@@ -126,12 +180,18 @@ class RancherTestRig:
 
 
 
-rancherTestRig = RancherTestRig(docker_host=DOCKER_HOST, rancher_host=HOST)
+rancherTestRig = RancherTestRig(rancher_host=HOST)
 
-#rancherTestRig.start_rancher_server_container(rebuild_container=True)
-rancherTestRig.wait_for_rancher_server_to_start()
+#rancherTestRig.start_rancher_server(rebuild=True)
+#rancherTestRig.start_rancher_server()
 
-rancherTestRig.set_rancher_host()
+rancherTestRig.wait_for_server_to_start()
+rancherTestRig.basic_configuration()
 
 
-#rancherTestRig.stop_rancher_server_container()
+#rancherTestRig.stop_server_container()
+
+
+
+
+
